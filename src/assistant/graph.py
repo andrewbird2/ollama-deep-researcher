@@ -1,10 +1,9 @@
 import json
-
 from typing_extensions import Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langgraph.graph import START, END, StateGraph
 
 from assistant.configuration import Configuration, SearchAPI
@@ -12,28 +11,64 @@ from assistant.utils import deduplicate_and_format_sources, tavily_search, forma
 from assistant.state import SummaryState, SummaryStateInput, SummaryStateOutput
 from assistant.prompts import query_writer_instructions, summarizer_instructions, reflection_instructions
 
-# Nodes   
+# Function schemas for OpenAI
+QUERY_SCHEMA = {
+    "name": "generate_search_query",
+    "description": "Generate a search query based on the research topic",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query to use"
+            }
+        },
+        "required": ["query"]
+    }
+}
+
+REFLECTION_SCHEMA = {
+    "name": "generate_followup_query",
+    "description": "Generate a follow-up query based on knowledge gaps",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "follow_up_query": {
+                "type": "string",
+                "description": "The follow-up search query"
+            }
+        },
+        "required": ["follow_up_query"]
+    }
+}
+
+# Nodes
 def generate_query(state: SummaryState, config: RunnableConfig):
     """ Generate a query for web search """
-    
+
     # Format the prompt
     query_writer_instructions_formatted = query_writer_instructions.format(research_topic=state.research_topic)
 
     # Generate a query
     configurable = Configuration.from_runnable_config(config)
-    llm_json_mode = ChatOllama(model=configurable.local_llm, temperature=0, format="json")
+    llm_json_mode = ChatOpenAI(model="o3-mini")
     result = llm_json_mode.invoke(
         [SystemMessage(content=query_writer_instructions_formatted),
-        HumanMessage(content=f"Generate a query for web search:")]
-    )   
-    query = json.loads(result.content)
-    
-    return {"search_query": query['query']}
+        HumanMessage(content=f"Generate a query for web search:")],
+        functions=[QUERY_SCHEMA]
+    )
+    function_call = result.additional_kwargs.get('function_call', {})
+    if function_call and function_call.get('name') == 'generate_search_query':
+        query_data = json.loads(function_call['arguments'])
+        return {"search_query": query_data['query']}
+
+    # Fallback if function calling fails
+    return {"search_query": state.research_topic}
 
 def web_research(state: SummaryState, config: RunnableConfig):
     """ Gather information from the web """
-    
-    # Configure 
+
+    # Configure
     configurable = Configuration.from_runnable_config(config)
 
     # Handle both cases for search_api:
@@ -46,19 +81,25 @@ def web_research(state: SummaryState, config: RunnableConfig):
 
     # Search the web
     if search_api == "tavily":
-        search_results = tavily_search(state.search_query, include_raw_content=True, max_results=1)
+        try:
+            print(state.search_query)
+            search_results = tavily_search(state.search_query, include_raw_content=True, max_results=5)
+        except Exception as e:
+            print(e)
+            print(state.search_query)
+            raise e
         search_str = deduplicate_and_format_sources(search_results, max_tokens_per_source=1000, include_raw_content=True)
     elif search_api == "perplexity":
         search_results = perplexity_search(state.search_query, state.research_loop_count)
         search_str = deduplicate_and_format_sources(search_results, max_tokens_per_source=1000, include_raw_content=False)
     else:
         raise ValueError(f"Unsupported search API: {configurable.search_api}")
-        
+
     return {"sources_gathered": [format_sources(search_results)], "research_loop_count": state.research_loop_count + 1, "web_research_results": [search_str]}
 
 def summarize_sources(state: SummaryState, config: RunnableConfig):
     """ Summarize the gathered sources """
-    
+
     # Existing summary
     existing_summary = state.running_summary
 
@@ -80,50 +121,42 @@ def summarize_sources(state: SummaryState, config: RunnableConfig):
 
     # Run the LLM
     configurable = Configuration.from_runnable_config(config)
-    llm = ChatOllama(model=configurable.local_llm, temperature=0)
+    llm = ChatOpenAI(model="o3-mini")
     result = llm.invoke(
         [SystemMessage(content=summarizer_instructions),
         HumanMessage(content=human_message_content)]
     )
 
-    running_summary = result.content
-
-    # TODO: This is a hack to remove the <think> tags w/ Deepseek models 
-    # It appears very challenging to prompt them out of the responses 
-    while "<think>" in running_summary and "</think>" in running_summary:
-        start = running_summary.find("<think>")
-        end = running_summary.find("</think>") + len("</think>")
-        running_summary = running_summary[:start] + running_summary[end:]
-
-    return {"running_summary": running_summary}
+    return {"running_summary": result.content}
 
 def reflect_on_summary(state: SummaryState, config: RunnableConfig):
     """ Reflect on the summary and generate a follow-up query """
 
     # Generate a query
     configurable = Configuration.from_runnable_config(config)
-    llm_json_mode = ChatOllama(model=configurable.local_llm, temperature=0, format="json")
+    llm_json_mode = ChatOpenAI(model="o3-mini")
     result = llm_json_mode.invoke(
         [SystemMessage(content=reflection_instructions.format(research_topic=state.research_topic)),
-        HumanMessage(content=f"Identify a knowledge gap and generate a follow-up web search query based on our existing knowledge: {state.running_summary}")]
-    )   
-    follow_up_query = json.loads(result.content)
+        HumanMessage(content=f"Identify a knowledge gap and generate a follow-up web search query based on our existing knowledge: {state.running_summary}")],
+        functions=[REFLECTION_SCHEMA]
+    )
+    function_call = result.additional_kwargs.get('function_call', {})
+    if function_call and function_call.get('name') == 'generate_followup_query':
+        query_data = json.loads(function_call['arguments'])
+        # Extract just the key information and format as a concise search query
+        llm_query_formatter = ChatOpenAI(model="o3-mini")
+        format_result = llm_query_formatter.invoke(
+            [SystemMessage(content="Convert the following query into a concise search-friendly format of no more than 10 words:"),
+             HumanMessage(content=query_data['follow_up_query'])]
+        )
+        return {"search_query": format_result.content}
 
-    # Get the follow-up query
-    query = follow_up_query.get('follow_up_query')
-
-    # JSON mode can fail in some cases
-    if not query:
-
-        # Fallback to a placeholder query
-        return {"search_query": f"Tell me more about {state.research_topic}"}
-
-    # Update search query with follow-up query
-    return {"search_query": follow_up_query['follow_up_query']}
+    # Fallback if function calling fails
+    return {"search_query": f"Tell me more about {state.research_topic}"}
 
 def finalize_summary(state: SummaryState):
     """ Finalize the summary """
-    
+
     # Format all accumulated sources into a single bulleted list
     all_sources = "\n".join(source for source in state.sources_gathered)
     state.running_summary = f"## Summary\n\n{state.running_summary}\n\n ### Sources:\n{all_sources}"
@@ -136,9 +169,9 @@ def route_research(state: SummaryState, config: RunnableConfig) -> Literal["fina
     if state.research_loop_count <= configurable.max_web_research_loops:
         return "web_research"
     else:
-        return "finalize_summary" 
-    
-# Add nodes and edges 
+        return "finalize_summary"
+
+# Add nodes and edges
 builder = StateGraph(SummaryState, input=SummaryStateInput, output=SummaryStateOutput, config_schema=Configuration)
 builder.add_node("generate_query", generate_query)
 builder.add_node("web_research", web_research)

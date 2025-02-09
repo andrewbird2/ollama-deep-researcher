@@ -1,20 +1,23 @@
 import operator
 from dataclasses import dataclass, field
-from typing_extensions import TypedDict, Annotated
+from typing import Optional, List
 
-@dataclass(kw_only=True)
+@dataclass
 class SummaryState:
-    research_topic: str = field(default=None) # Report topic     
-    search_query: str = field(default=None) # Search query
-    web_research_results: Annotated[list, operator.add] = field(default_factory=list) 
-    sources_gathered: Annotated[list, operator.add] = field(default_factory=list) 
-    research_loop_count: int = field(default=0) # Research loop count
-    running_summary: str = field(default=None) # Final report
+    """The state of the research assistant."""
+    research_topic: str
+    search_query: Optional[str] = None
+    web_research_results: List[str] = field(default_factory=list)
+    sources_gathered: List[str] = field(default_factory=list)
+    research_loop_count: int = 0
+    running_summary: Optional[str] = None
 
-@dataclass(kw_only=True)
+@dataclass
 class SummaryStateInput:
-    research_topic: str = field(default=None) # Report topic     
+    """The input state for the research assistant."""
+    research_topic: str
 
-@dataclass(kw_only=True)
+@dataclass
 class SummaryStateOutput:
-    running_summary: str = field(default=None) # Final report
+    """The output state for the research assistant."""
+    running_summary: str
